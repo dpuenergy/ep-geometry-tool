@@ -2,8 +2,9 @@
 // Zone fill color is driven by ZoneType. Edge colors: red = incomplete, yellow = warning, green = complete.
 
 import { Line, Circle, Text } from 'react-konva'
+import type { KonvaEventObject } from 'konva/lib/Node'
 import { useProjectStore } from '../../store/projectStore'
-import { Zone, Surface, Edge } from '../../types'
+import { Zone, Surface, Edge, Point } from '../../types'
 
 const EDGE_COLORS: Record<Edge['status'], string> = {
   incomplete: '#ef4444',  // red-500
@@ -20,6 +21,21 @@ function hexToRgba(hex: string, alpha: number): string {
   return `rgba(${r},${g},${b},${alpha})`
 }
 
+/** Project a screen-space click event onto an edge segment, clamped to (0.05, 0.95). */
+function projectedPoint(e: KonvaEventObject<MouseEvent>, p1: Point, p2: Point): Point {
+  const stage = e.target.getStage()
+  const sp = stage?.getPointerPosition()
+  if (!sp) return { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 }
+  const pos = stage!.position()
+  const s   = stage!.scaleX()
+  const wx  = (sp.x - pos.x) / s
+  const wy  = (sp.y - pos.y) / s
+  const dx = p2.x - p1.x, dy = p2.y - p1.y
+  const len2 = dx * dx + dy * dy
+  const t = len2 < 1e-6 ? 0.5 : Math.max(0.05, Math.min(0.95, ((wx - p1.x) * dx + (wy - p1.y) * dy) / len2))
+  return { x: p1.x + t * dx, y: p1.y + t * dy }
+}
+
 interface PolygonShapeProps {
   id: string
   points: Zone['points'] | Surface['points']
@@ -28,10 +44,11 @@ interface PolygonShapeProps {
   isSelected: boolean
   fillColor: string
   onEdgeClick: (edgeId: string) => void
+  onEdgeSplit: (edgeId: string, point: Point) => void
   onFillClick?: (id: string) => void
 }
 
-function PolygonShape({ id, points, edgeIds, label, isSelected, fillColor, onEdgeClick, onFillClick }: PolygonShapeProps) {
+function PolygonShape({ id, points, edgeIds, label, isSelected, fillColor, onEdgeClick, onEdgeSplit, onFillClick }: PolygonShapeProps) {
   const { project } = useProjectStore()
   const flatPoints = points.flatMap((p) => [p.x, p.y])
 
@@ -66,6 +83,10 @@ function PolygonShape({ id, points, edgeIds, label, isSelected, fillColor, onEdg
               e.cancelBubble = true
               onEdgeClick(edgeId)
             }}
+            onDblClick={(e) => {
+              e.cancelBubble = true
+              onEdgeSplit(edgeId, projectedPoint(e, edge.points[0], edge.points[1]))
+            }}
           />
         )
       })}
@@ -90,7 +111,7 @@ function PolygonShape({ id, points, edgeIds, label, isSelected, fillColor, onEdg
 }
 
 export default function PolygonLayer() {
-  const { project, selectedEdgeId, selectedZoneId, selectedSurfaceId, selectEdge, selectZone, selectSurface } = useProjectStore()
+  const { project, selectedEdgeId, selectedZoneId, selectedSurfaceId, selectEdge, selectZone, selectSurface, splitEdge } = useProjectStore()
   const { activeDrawingId } = project
   const activeDrawing = project.drawings.find(d => d.id === activeDrawingId)
   const viewType = activeDrawing?.viewType ?? 'plan'
@@ -113,6 +134,7 @@ export default function PolygonLayer() {
               isSelected={isSelected}
               fillColor={fillColor}
               onEdgeClick={selectEdge}
+              onEdgeSplit={splitEdge}
               onFillClick={selectZone}
             />
           )
@@ -137,6 +159,7 @@ export default function PolygonLayer() {
             isSelected={isSelected}
             fillColor="#6b7280"
             onEdgeClick={selectEdge}
+            onEdgeSplit={splitEdge}
             onFillClick={selectSurface}
           />
         )

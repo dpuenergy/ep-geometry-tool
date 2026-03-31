@@ -198,6 +198,7 @@ export default function ImageCanvas() {
   const [hoveredVertex, setHoveredVertex]       = useState<Point | null>(null)
   const [isVertexDragging, setIsVertexDragging] = useState(false)
   const [vertexDragPreview, setVertexDragPreview] = useState<Point | null>(null)
+  const hoveredVertexRef  = useRef<Point | null>(null)
   const vertexDragOrig    = useRef<Point | null>(null)
   const vertexDragCurrentRef = useRef<Point | null>(null)
   const isVertexDraggingRef = useRef(false)
@@ -283,11 +284,19 @@ export default function ImageCanvas() {
         return
       }
 
-      // Delete / Backspace: delete selected zone or surface
+      // Delete / Backspace: delete hovered vertex OR selected zone/surface
       if ((e.key === 'Delete' || e.key === 'Backspace') && mode === 'idle') {
         const { selectedZoneId, selectedSurfaceId,
                 deleteZone: dz, deleteSurface: ds,
-                selectZone: sz, selectSurface: ss } = useProjectStore.getState()
+                deleteVertex: dvx,
+                selectZone: sz, selectSurface: ss,
+                project: proj } = useProjectStore.getState()
+        // Priority: delete hovered vertex first
+        const hv = hoveredVertexRef.current
+        if (hv) {
+          dvx(proj.activeDrawingId, hv)
+          return
+        }
         if (selectedZoneId) {
           const ok = dz(selectedZoneId)
           if (!ok && confirm('Zóna má dokončené hrany. Opravdu smazat?')) dz(selectedZoneId, true)
@@ -699,6 +708,7 @@ export default function ImageCanvas() {
       const pos = clientToWorld(e.clientX, e.clientY)
       if (!pos) return
       const v = nearestVertex(pos)
+      hoveredVertexRef.current = v
       setHoveredVertex(v)
       setCanvasCursor(v ? 'crosshair' : 'grab')
     }

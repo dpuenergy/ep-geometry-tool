@@ -158,6 +158,8 @@ interface ProjectState {
   moveWallEdge: (edgeId: string, offsetMeters: number) => void
   resizeEdge: (edgeId: string, newLengthMeters: number) => void
   moveVertex: (drawingId: string, oldPoint: Point, newPoint: Point) => void
+  splitEdge: (edgeId: string, point: Point) => void
+  deleteVertex: (drawingId: string, point: Point) => void
   linkEdges: (edgeId: string, linkedEdgeId: string | null) => void
   selectEdge: (edgeId: string | null) => void
   selectedEdgeId: string | null
@@ -917,6 +919,111 @@ export const useProjectStore = create<ProjectState>()(
             return { ...z, points: newPoints, areaM2 }
           })
           const updated = { ...project, zones: newZones, edges: newEdgesRecord }
+          return { project: updated, metrics: computeMetrics(updated) }
+        }),
+
+      splitEdge: (edgeId, point) =>
+        set(st => {
+          const edge = st.project.edges[edgeId]
+          if (!edge) return st
+          // Find zone or surface containing this edge
+          const zone = st.project.zones.find(z => z.edgeIds.includes(edgeId))
+          const surface = !zone ? st.project.surfaces.find(s => s.edgeIds.includes(edgeId)) : undefined
+          const container = zone ?? surface
+          if (!container) return st
+          const drawing = st.project.drawings.find(d => d.id === container.drawingId)
+          if (!drawing?.scale) return st
+
+          const eIdx = container.edgeIds.indexOf(edgeId)
+          const [p1, p2] = edge.points
+          const id1 = uuid(), id2 = uuid()
+          const len1 = round2(pxToMeters(distancePx(p1, point), drawing.scale!))
+          const len2 = round2(pxToMeters(distancePx(point, p2), drawing.scale!))
+          const base: Omit<Edge, 'id' | 'points' | 'lengthMeters'> = {
+            construction: edge.construction,
+            openings: [], openingsConfirmed: false,
+            status: edge.construction ? 'warning' : 'incomplete',
+            linkedEdgeId: null,
+          }
+          const newEdge1: Edge = { id: id1, points: [p1, point], lengthMeters: len1, ...base }
+          const newEdge2: Edge = { id: id2, points: [point, p2], lengthMeters: len2, ...base }
+
+          // Insert point after p1 (at eIdx+1 in points, replace edgeId with id1+id2 in edgeIds)
+          const newPoints = [
+            ...container.points.slice(0, eIdx + 1),
+            point,
+            ...container.points.slice(eIdx + 1),
+          ]
+          const newEdgeIds = [
+            ...container.edgeIds.slice(0, eIdx),
+            id1, id2,
+            ...container.edgeIds.slice(eIdx + 1),
+          ]
+          const newEdgesRecord = { ...st.project.edges }
+          delete newEdgesRecord[edgeId]
+          newEdgesRecord[id1] = newEdge1
+          newEdgesRecord[id2] = newEdge2
+
+          let newZones = st.project.zones
+          let newSurfaces = st.project.surfaces
+          if (zone) {
+            const areaM2 = round2(pxAreaToM2(polygonAreaPx(newPoints), drawing.scale!))
+            newZones = st.project.zones.map(z =>
+              z.id === zone.id ? { ...z, points: newPoints, edgeIds: newEdgeIds, areaM2 } : z
+            )
+          } else if (surface) {
+            newSurfaces = st.project.surfaces.map(s =>
+              s.id === surface.id ? { ...s, points: newPoints, edgeIds: newEdgeIds } : s
+            )
+          }
+          const updated = { ...st.project, zones: newZones, surfaces: newSurfaces, edges: newEdgesRecord }
+          return { project: updated, metrics: computeMetrics(updated) }
+        }),
+
+      deleteVertex: (drawingId, point) =>
+        set(st => {
+          const EPS = 3
+          const newEdgesRecord = { ...st.project.edges }
+
+          const newZones = st.project.zones.map(z => {
+            if (z.drawingId !== drawingId) return z
+            const pIdx = z.points.findIndex(p => Math.hypot(p.x - point.x, p.y - point.y) < EPS)
+            if (pIdx === -1) return z
+            if (z.points.length <= 3) return z  // can't reduce below triangle
+
+            const n = z.points.length
+            const inEdgeIdx  = (pIdx - 1 + n) % n
+            const outEdgeIdx = pIdx
+            const prevPt = z.points[(pIdx - 1 + n) % n]
+            const nextPt = z.points[(pIdx + 1) % n]
+
+            const drawing = st.project.drawings.find(d => d.id === drawingId)
+            const newLen = drawing?.scale ? round2(pxToMeters(distancePx(prevPt, nextPt), drawing.scale)) : 0
+            const inEdge  = st.project.edges[z.edgeIds[inEdgeIdx]]
+            const newEdgeId = uuid()
+            const newEdge: Edge = {
+              id: newEdgeId,
+              points: [prevPt, nextPt],
+              lengthMeters: newLen,
+              construction: inEdge?.construction ?? null,
+              openings: [], openingsConfirmed: false,
+              status: inEdge?.construction ? 'warning' : 'incomplete',
+              linkedEdgeId: null,
+            }
+            delete newEdgesRecord[z.edgeIds[inEdgeIdx]]
+            delete newEdgesRecord[z.edgeIds[outEdgeIdx]]
+            newEdgesRecord[newEdgeId] = newEdge
+
+            // Replace inEdge with newEdge, remove outEdge
+            const tempIds = [...z.edgeIds]
+            tempIds[inEdgeIdx] = newEdgeId
+            const newEdgeIds = tempIds.filter((_, i) => i !== outEdgeIdx)
+            const newPoints  = z.points.filter((_, i) => i !== pIdx)
+            const areaM2 = drawing?.scale ? round2(pxAreaToM2(polygonAreaPx(newPoints), drawing.scale)) : z.areaM2
+            return { ...z, points: newPoints, edgeIds: newEdgeIds, areaM2 }
+          })
+
+          const updated = { ...st.project, zones: newZones, edges: newEdgesRecord }
           return { project: updated, metrics: computeMetrics(updated) }
         }),
 
