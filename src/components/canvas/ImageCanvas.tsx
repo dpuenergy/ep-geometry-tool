@@ -174,7 +174,9 @@ export default function ImageCanvas() {
   const [cursorPos, setCursorPos]           = useState<Point | null>(null)
   const [snapActive, setSnapActive]         = useState(false)
   const drawPointsRef                       = useRef<Point[]>([])
+  const modeRef                             = useRef<DrawMode>('idle')
   useEffect(() => { drawPointsRef.current = drawPoints }, [drawPoints])
+  useEffect(() => { modeRef.current = mode }, [mode])
 
   // Pending polygon points waiting for zone type assignment (plan view)
   const [pendingPlanPoints, setPendingPlanPoints] = useState<Point[] | null>(null)
@@ -235,6 +237,71 @@ export default function ImageCanvas() {
     window.addEventListener('keyup', up)
     return () => { window.removeEventListener('keydown', down); window.removeEventListener('keyup', up) }
   }, [])
+
+  // ── Keyboard shortcuts ────────────────────────────────────────────────────
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      // Don't fire while typing in an input/textarea
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
+
+      const mode = modeRef.current
+
+      // Escape: cancel drawing/scale, or deselect
+      if (e.key === 'Escape') {
+        if (mode === 'drawing' || mode === 'setScaleA' || mode === 'setScaleB') {
+          setMode('idle')
+          setDrawPoints([])
+          setSnapActive(false)
+          setScalePointA(null)
+          setCursorPos(null)
+          setOrthoSnap(null)
+          setOrthoAxis(null)
+        } else {
+          const { selectEdge: se, selectZone: sz, selectSurface: ss } = useProjectStore.getState()
+          se(null); sz(null); ss(null)
+        }
+        return
+      }
+
+      // Enter: close polygon when drawing (≥3 points)
+      if (e.key === 'Enter' && mode === 'drawing') {
+        if (drawPointsRef.current.length >= 3) {
+          // Inline close polygon (avoids stale closure on closePolygon)
+          const pts = drawPointsRef.current
+          setDrawPoints([])
+          setMode('idle')
+          setSnapActive(false)
+          setCursorPos(null)
+          const { project: proj, addSurface: as_ } = useProjectStore.getState()
+          const drawing = proj.drawings.find(d => d.id === proj.activeDrawingId)
+          if (drawing?.viewType !== 'plan') {
+            as_(pts)
+          } else {
+            setPendingPlanPoints(pts)
+          }
+        }
+        return
+      }
+
+      // Delete / Backspace: delete selected zone or surface
+      if ((e.key === 'Delete' || e.key === 'Backspace') && mode === 'idle') {
+        const { selectedZoneId, selectedSurfaceId,
+                deleteZone: dz, deleteSurface: ds,
+                selectZone: sz, selectSurface: ss } = useProjectStore.getState()
+        if (selectedZoneId) {
+          const ok = dz(selectedZoneId)
+          if (!ok && confirm('Zóna má dokončené hrany. Opravdu smazat?')) dz(selectedZoneId, true)
+          sz(null)
+        } else if (selectedSurfaceId) {
+          ds(selectedSurfaceId)
+          ss(null)
+        }
+      }
+    }
+
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Container width ──
   const containerRef = useRef<HTMLDivElement>(null)
@@ -913,7 +980,7 @@ export default function ImageCanvas() {
                 : snapActive
                 ? '🟢 Klikněte pro zavření polygonu'
                 : `${drawPoints.length} bodů – dvojklik nebo klik na ● pro zavření`}
-              <span className="text-blue-500 ml-2 text-xs">· tažení = posun · kolečko = zoom · Shift = kolmý úhel</span>
+              <span className="text-blue-500 ml-2 text-xs">· Shift = kolmý úhel · Enter = uzavřít · Esc = zrušit</span>
             </p>
           )}
           {mode === 'idle' && isVertexDragging && (
@@ -928,7 +995,7 @@ export default function ImageCanvas() {
           )}
           {mode === 'idle' && !isVertexDragging && !hoveredVertex && (
             <p className="text-xs text-gray-400">
-              Tažení = posun &nbsp;·&nbsp; kolečko = zoom &nbsp;·&nbsp; rohové body = přetažením upravit
+              Tažení = posun · kolečko = zoom · rohy = přetáhnout · Del = smazat vybrané · Esc = zrušit výběr
             </p>
           )}
         </div>
