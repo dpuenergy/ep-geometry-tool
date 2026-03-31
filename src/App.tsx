@@ -1,7 +1,7 @@
 // Main application layout
 // Left: canvas | Right: panels (edge wizard, zones, library, results, export)
 
-import { useRef, useState, lazy, Suspense } from 'react'
+import { useRef, useState, lazy, Suspense, useEffect } from 'react'
 import ImageCanvas from './components/canvas/ImageCanvas'
 import EdgeWizard from './components/panels/EdgeWizard'
 import ZoneSurfaceWizard from './components/panels/ZoneSurfaceWizard'
@@ -16,7 +16,19 @@ import { useProjectStore } from './store/projectStore'
 const Model3D = lazy(() => import('./components/viewer/Model3D'))
 
 export default function App() {
-  const { project, resetProject, exportProjectFile, importProjectFile } = useProjectStore()
+  const { project, resetProject, exportProjectFile, importProjectFile, undo, redo, past, future } = useProjectStore()
+
+  // Global Ctrl+Z / Ctrl+Y (or Ctrl+Shift+Z) for undo/redo
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      const ctrl = e.ctrlKey || e.metaKey
+      if (!ctrl) return
+      if (e.key === 'z' && !e.shiftKey) { e.preventDefault(); undo() }
+      if (e.key === 'y' || (e.key === 'z' && e.shiftKey)) { e.preventDefault(); redo() }
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [undo, redo])
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [importError, setImportError]   = useState<string | null>(null)
   const [show3D, setShow3D]             = useState(false)
@@ -48,6 +60,20 @@ export default function App() {
           </>
         )}
         <div className="ml-auto flex items-center gap-2">
+          {/* Undo / Redo */}
+          <button
+            className="btn-secondary text-xs px-2 disabled:opacity-30"
+            title="Zpět (Ctrl+Z)"
+            onClick={undo}
+            disabled={past.length === 0}
+          >↩ Zpět</button>
+          <button
+            className="btn-secondary text-xs px-2 disabled:opacity-30"
+            title="Znovu (Ctrl+Y)"
+            onClick={redo}
+            disabled={future.length === 0}
+          >↪ Znovu</button>
+          <div className="w-px h-4 bg-gray-200" />
           {importError && (
             <span className="text-xs text-red-500">{importError}</span>
           )}

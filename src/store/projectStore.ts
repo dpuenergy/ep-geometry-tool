@@ -110,6 +110,12 @@ interface ProjectState {
   project: Project
   metrics: ProjectMetrics
 
+  // Undo / redo history (not persisted)
+  past: Project[]
+  future: Project[]
+  undo: () => void
+  redo: () => void
+
   // Project metadata
   setProjectMeta: (changes: { name?: string; buildingType?: string; location?: string }) => void
 
@@ -200,12 +206,61 @@ const emptyMetrics: ProjectMetrics = {
 
 export const useProjectStore = create<ProjectState>()(
   persist(
-    (set, get) => ({
+    (rawSet, get) => {
+      // Wrap rawSet: automatically push current project to `past` whenever project changes.
+      // undo/redo use rawSet directly and therefore bypass this wrapper.
+      type Updater = (st: ProjectState) => Partial<ProjectState>
+      const set = (partial: Updater | Partial<ProjectState>) => {
+        if (typeof partial === 'function') {
+          rawSet((st: ProjectState) => {
+            const result = partial(st)
+            if (result.project && result.project !== st.project) {
+              return { ...result, past: [...st.past.slice(-49), st.project], future: [] }
+            }
+            return result
+          })
+        } else {
+          rawSet((st: ProjectState) => {
+            if ((partial as Partial<ProjectState>).project && (partial as Partial<ProjectState>).project !== st.project) {
+              return { ...partial, past: [...st.past.slice(-49), st.project], future: [] }
+            }
+            return partial
+          })
+        }
+      }
+
+      return {
       project: emptyProject(),
       metrics: emptyMetrics,
+      past: [],
+      future: [],
       selectedEdgeId: null,
       selectedZoneId: null,
       selectedSurfaceId: null,
+
+      undo: () =>
+        rawSet((st: ProjectState) => {
+          if (st.past.length === 0) return st
+          const prev = st.past[st.past.length - 1]
+          return {
+            project: prev,
+            metrics: computeMetrics(prev),
+            past: st.past.slice(0, -1),
+            future: [st.project, ...st.future.slice(0, 49)],
+          }
+        }),
+
+      redo: () =>
+        rawSet((st: ProjectState) => {
+          if (st.future.length === 0) return st
+          const next = st.future[0]
+          return {
+            project: next,
+            metrics: computeMetrics(next),
+            past: [...st.past.slice(-49), st.project],
+            future: st.future.slice(1),
+          }
+        }),
 
       // ── Project metadata ────────────────────────────────────────────────────
 
@@ -978,13 +1033,12 @@ export const useProjectStore = create<ProjectState>()(
           return 'Soubor nelze načíst – zkontrolujte formát.'
         }
       },
-    }),
+    } // end return
+    }, // end factory
     {
       name: 'ep-project',
-      // Exclude backgroundImage (base64) from localStorage – it fills the quota quickly.
-      // Images are re-uploaded by the user each session; all other state persists normally.
+      // Exclude backgroundImage and undo/redo history from localStorage.
       partialize: (state) => ({
-        ...state,
         project: {
           ...state.project,
           drawings: state.project.drawings.map(d => ({
@@ -992,6 +1046,11 @@ export const useProjectStore = create<ProjectState>()(
             backgroundImage: null,
           })),
         },
+        metrics: state.metrics,
+        selectedEdgeId: state.selectedEdgeId,
+        selectedZoneId: state.selectedZoneId,
+        selectedSurfaceId: state.selectedSurfaceId,
+        // past/future intentionally omitted — history does not persist across sessions
       }),
       merge: (persisted, current) => {
         const p = persisted as typeof current
