@@ -177,12 +177,17 @@ function buildScene(project: Project): SceneResult {
     addHFace(zBase + h, zone.ceilingConstruction, ceilMeshes,  'ceiling')
   }
 
-  // Ground grid
+  // Ground grid + world axes indicator
   if (isFinite(xMin)) {
     const cx = (xMin+xMax)/2, cz = (zMin+zMax)/2
     const span = Math.max(xMax-xMin, zMax-zMin, 1) * 2.5
     const grid = new THREE.GridHelper(span, Math.min(200, Math.max(10, Math.round(span))), 0x9ca3af, 0xe5e7eb)
     grid.position.set(cx, -0.01, cz); scene.add(grid)
+    // Small axes indicator at grid corner (X=red, Y=green, Z=blue)
+    const axLen = Math.max((xMax - xMin) * 0.08, 0.6)
+    const axH = new THREE.AxesHelper(axLen)
+    axH.position.set(xMin, 0, zMin)
+    scene.add(axH)
   }
 
   const target = isFinite(xMin)
@@ -199,19 +204,24 @@ export default function Model3D({ onClose }: { onClose: () => void }) {
   const {
     project, selectEdge, selectZone,
     selectedEdgeId, selectedZoneId,
-    addZoneToDrawing,
+    addZoneToDrawing, moveWallEdge,
   } = useProjectStore()
   const { constructions: library } = useLibraryStore()
 
   // UI state
   const [error, setError]             = useState<string | null>(null)
   const [drawMode, setDrawMode]       = useState(false)
+  const [pushPullMode, setPushPullMode] = useState(false)
+  const [ppOffsetDisplay, setPpOffsetDisplay] = useState<number | null>(null)
   const [drawTab, setDrawTab]         = useState<'horizontal' | 'vertical'>('horizontal')
   const [drawConstrType, setDrawConstrType] = useState<ConstructionType | ''>('')
   const [drawTargetId, setDrawTargetId]     = useState<string>('')
   const [drawZoneTypeId, setDrawZoneTypeId] = useState<string>('')
   const [draftCount, setDraftCount]   = useState(0)
   const [snapActive, setSnapActive]   = useState(false)
+
+  // Gizmo ref
+  const gizmoCanvasRef     = useRef<HTMLCanvasElement>(null)
 
   // Three.js refs
   const containerRef       = useRef<HTMLDivElement>(null)
@@ -231,6 +241,18 @@ export default function Model3D({ onClose }: { onClose: () => void }) {
   const activeMeshRef      = useRef<THREE.Mesh | null>(null)
   const savedEmissive      = useRef(new THREE.Color())
 
+  // Push-pull refs
+  const pushPullModeRef = useRef(false)
+  const ppActiveRef = useRef<{
+    edgeId: string
+    normal: THREE.Vector3
+    plane: THREE.Plane        // camera-facing plane for ray intersection
+    startHit: THREE.Vector3
+    mesh: THREE.Mesh
+    origPos: THREE.Vector3
+    currentDisp: number       // current displacement in metres
+  } | null>(null)
+
   // Draw-mode refs (used in event handlers — avoid stale closures)
   const drawModeRef       = useRef(false)
   const drawConstrTypeRef = useRef<ConstructionType | ''>('')
@@ -241,6 +263,7 @@ export default function Model3D({ onClose }: { onClose: () => void }) {
   const libraryRef        = useRef(library)
 
   // Sync refs → state
+  useEffect(() => { pushPullModeRef.current = pushPullMode }, [pushPullMode])
   useEffect(() => { drawModeRef.current       = drawMode       }, [drawMode])
   useEffect(() => { drawConstrTypeRef.current = drawConstrType }, [drawConstrType])
   useEffect(() => { drawTargetIdRef.current   = drawTargetId   }, [drawTargetId])
@@ -440,6 +463,21 @@ export default function Model3D({ onClose }: { onClose: () => void }) {
     return { x: Math.round((wx + off.dx) * ppm), y: Math.round((wz + off.dz) * ppm) }
   }
 
+  // ── Wall normal for push/pull ─────────────────────────────────────────────
+
+  function wallNormalForEdge(edgeId: string): THREE.Vector3 | null {
+    const proj = useProjectStore.getState().project
+    const edge = proj.edges[edgeId]; if (!edge) return null
+    const zone = proj.zones.find(z => z.edgeIds.includes(edgeId)); if (!zone) return null
+    const drawing = proj.drawings.find(d => d.id === zone.drawingId)
+    const ppm = drawing?.scale?.pixelsPerMeter ?? 100
+    const [p1, p2] = edge.points
+    const dx = (p2.x - p1.x) / ppm, dz = (p2.y - p1.y) / ppm
+    const len = Math.hypot(dx, dz)
+    if (len < 1e-6) return null
+    return new THREE.Vector3(-dz / len, 0, dx / len)
+  }
+
   // ── Finish polygon (horizontal or vertical) ───────────────────────────────
 
   function finishPolygon() {
@@ -518,10 +556,71 @@ export default function Model3D({ onClose }: { onClose: () => void }) {
         camera.aspect = w / h; camera.updateProjectionMatrix(); renderer.setSize(w, h)
       }); ro.observe(container)
 
+      // ── Orientation gizmo (2D canvas overlay) ───────────────────────────
+      function renderGizmo() {
+        const canvas = gizmoCanvasRef.current
+        if (!canvas) return
+        const dpr = window.devicePixelRatio || 1
+        const sz  = 90
+        if (canvas.width !== sz * dpr) {
+          canvas.width  = sz * dpr
+          canvas.height = sz * dpr
+        }
+        const ctx = canvas.getContext('2d')
+        if (!ctx) return
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+        ctx.clearRect(0, 0, sz, sz)
+
+        const cx = sz / 2, cy = sz / 2, r = sz * 0.33
+
+        // Background circle
+        ctx.fillStyle = 'rgba(15,23,42,0.55)'
+        ctx.beginPath(); ctx.arc(cx, cy, sz / 2 - 1, 0, Math.PI * 2); ctx.fill()
+
+        // Axes to project: positive + negative halves
+        const axisDefs = [
+          { v: new THREE.Vector3(1, 0, 0), posColor: '#ef4444', negColor: 'rgba(239,68,68,0.22)', label: 'X' },
+          { v: new THREE.Vector3(0, 1, 0), posColor: '#22c55e', negColor: 'rgba(34,197,94,0.22)',  label: 'Y' },
+          { v: new THREE.Vector3(0, 0, 1), posColor: '#60a5fa', negColor: 'rgba(96,165,250,0.22)', label: 'Z' },
+        ]
+
+        type GizmoAxis = {
+          sx: number; sy: number; depth: number
+          color: string; dot: boolean; label: string; lineW: number
+        }
+        const all: GizmoAxis[] = []
+        for (const ax of axisDefs) {
+          const pos = ax.v.clone().applyQuaternion(camera.quaternion)
+          const neg = ax.v.clone().negate().applyQuaternion(camera.quaternion)
+          all.push({ sx: neg.x, sy: -neg.y, depth: neg.z, color: ax.negColor, dot: false, label: '', lineW: 1.5 })
+          all.push({ sx: pos.x, sy: -pos.y, depth: pos.z, color: ax.posColor, dot: true,  label: ax.label, lineW: 2.5 })
+        }
+        all.sort((a, b) => a.depth - b.depth) // back to front
+
+        for (const ax of all) {
+          const ex = cx + ax.sx * r, ey = cy + ax.sy * r
+          ctx.strokeStyle = ax.color
+          ctx.lineWidth   = ax.lineW
+          ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(ex, ey); ctx.stroke()
+          if (ax.dot) {
+            ctx.fillStyle = ax.color
+            ctx.beginPath(); ctx.arc(ex, ey, 4.5, 0, Math.PI * 2); ctx.fill()
+            if (ax.label) {
+              ctx.fillStyle   = '#ffffff'
+              ctx.font        = 'bold 11px system-ui'
+              ctx.textAlign   = 'center'
+              ctx.textBaseline = 'middle'
+              ctx.fillText(ax.label, cx + ax.sx * (r + 13), cy + ax.sy * (r + 13))
+            }
+          }
+        }
+      }
+
       function animate() {
         animId = requestAnimationFrame(animate)
         controls.update()
         renderer.render(sceneRef.current!, camera)
+        renderGizmo()
       }
       animate()
 
@@ -550,8 +649,46 @@ export default function Model3D({ onClose }: { onClose: () => void }) {
         }
       }
 
-      function onPointerDown(e: PointerEvent) { dragStartX = e.clientX; dragStartY = e.clientY; dragging = false }
+      function onPointerDown(e: PointerEvent) {
+        dragStartX = e.clientX; dragStartY = e.clientY; dragging = false
+        // Push-pull: start drag when clicking on a wall face
+        if (pushPullModeRef.current) {
+          raycaster.setFromCamera(getMouseVec(e), camera)
+          const hits = raycaster.intersectObjects(clickableMeshesRef.current)
+          if (hits.length && (hits[0].object as THREE.Mesh).userData.kind === 'wall') {
+            const m = hits[0].object as THREE.Mesh
+            const normal = wallNormalForEdge(m.userData.edgeId)
+            if (normal) {
+              const hitPt = hits[0].point.clone()
+              // Use a camera-facing plane so mouse movement maps cleanly to 3D delta.
+              // The wall-face plane would give dot(hit-startHit, wallNormal) ≡ 0.
+              const camDir = camera.getWorldDirection(new THREE.Vector3())
+              const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(camDir, hitPt)
+              ppActiveRef.current = {
+                edgeId: m.userData.edgeId, normal, plane,
+                startHit: hitPt, mesh: m, origPos: m.position.clone(), currentDisp: 0,
+              }
+              renderer.domElement.setPointerCapture(e.pointerId)
+            }
+          }
+          return  // don't fall through to orbit/select
+        }
+      }
+
       function onPointerMove(e: PointerEvent) {
+        // Push-pull drag: project mouse-driven 3D delta onto wall normal
+        if (ppActiveRef.current) {
+          const pp = ppActiveRef.current
+          raycaster.setFromCamera(getMouseVec(e), camera)
+          const hit = new THREE.Vector3()
+          if (raycaster.ray.intersectPlane(pp.plane, hit)) {
+            const disp = hit.clone().sub(pp.startHit).dot(pp.normal)
+            pp.currentDisp = disp
+            pp.mesh.position.copy(pp.origPos).addScaledVector(pp.normal, disp)
+            setPpOffsetDisplay(Math.round(disp * 100) / 100)
+          }
+          return
+        }
         // Only track dragging in select mode — in draw mode orbiting is disabled so dragging is irrelevant
         if (!drawModeRef.current && Math.hypot(e.clientX - dragStartX, e.clientY - dragStartY) > 5) dragging = true
         if (!drawModeRef.current) return
@@ -571,6 +708,20 @@ export default function Model3D({ onClose }: { onClose: () => void }) {
       }
 
       function onPointerUp(e: PointerEvent) {
+        // Commit push-pull drag
+        if (ppActiveRef.current) {
+          const pp = ppActiveRef.current
+          const disp = pp.currentDisp
+          pp.mesh.position.copy(pp.origPos) // reset preview mesh to avoid double-shift
+          ppActiveRef.current = null
+          setPpOffsetDisplay(null)
+          try { renderer.domElement.releasePointerCapture(e.pointerId) } catch (_) { /* ignore */ }
+          if (Math.abs(disp) > 0.01) {
+            moveWallEdge(pp.edgeId, disp)
+            rebuildScene()
+          }
+          return
+        }
         // In draw mode orbiting is disabled — always handle the click.
         // In select mode skip drags (user was orbiting).
         if (!drawModeRef.current && dragging) return
@@ -634,10 +785,11 @@ export default function Model3D({ onClose }: { onClose: () => void }) {
 
   useEffect(() => {
     const el = rendererRef.current?.domElement; if (!el) return
-    el.style.cursor = drawMode ? 'crosshair' : 'default'
-    if (controlsRef.current) controlsRef.current.enabled = !drawMode
+    el.style.cursor = drawMode ? 'crosshair' : pushPullMode ? 'ew-resize' : 'default'
+    if (controlsRef.current) controlsRef.current.enabled = !drawMode && !pushPullMode
     if (!drawMode) { draftPtsRef.current = []; setDraftCount(0); setSnapActive(false); updateDraft([]) }
-  }, [drawMode]) // eslint-disable-line
+    if (!pushPullMode) { ppActiveRef.current = null; setPpOffsetDisplay(null) }
+  }, [drawMode, pushPullMode]) // eslint-disable-line
 
   // Switch construction default when tab changes
   useEffect(() => {
@@ -789,6 +941,14 @@ export default function Model3D({ onClose }: { onClose: () => void }) {
           >
             ✏ {drawMode ? 'Kreslení ZAP' : 'Kreslit'}
           </button>
+          <button
+            onClick={() => { setPushPullMode(m => !m); if (drawMode) setDrawMode(false) }}
+            className="text-white px-3 py-1 rounded text-sm"
+            style={{ border: `1px solid ${pushPullMode ? '#f59e0b' : '#4b5563'}`, background: pushPullMode ? 'rgba(245,158,11,0.2)' : undefined }}
+            title="Táhněte stěnu pro změnu rozměrů"
+          >
+            ↔ {pushPullMode ? 'Posun ZAP' : 'Posunout stěnu'}
+          </button>
           <button onClick={() => resetCameraRef.current?.()} className="text-white px-3 py-1 rounded text-sm" style={{ border: '1px solid #4b5563' }}>⌂ Reset</button>
           <button onClick={onClose} className="text-white px-3 py-1 rounded text-sm" style={{ border: '1px solid #4b5563' }}>Zavřít ✕</button>
         </div>
@@ -816,6 +976,30 @@ export default function Model3D({ onClose }: { onClose: () => void }) {
           }}>
             {selectedEdgeId && <EdgeWizard />}
             {!selectedEdgeId && selectedZoneId && <ZoneSurfaceWizard />}
+          </div>
+        )}
+        {/* Orientation gizmo */}
+        <canvas
+          ref={gizmoCanvasRef}
+          style={{
+            position: 'absolute', top: 12, left: 12,
+            width: 90, height: 90,
+            borderRadius: '50%', pointerEvents: 'none',
+            zIndex: 5,
+          }}
+        />
+
+        {/* Push-pull overlay */}
+        {pushPullMode && (
+          <div style={{
+            position: 'absolute', top: 12, left: '50%', transform: 'translateX(-50%)',
+            background: 'rgba(245,158,11,0.92)', color: '#1c1917',
+            borderRadius: 8, padding: '6px 16px', fontSize: 13, fontWeight: 600,
+            pointerEvents: 'none', zIndex: 10,
+          }}>
+            {ppOffsetDisplay !== null
+              ? `${ppOffsetDisplay >= 0 ? '+' : ''}${ppOffsetDisplay.toFixed(2)} m`
+              : '↔ Klikněte na stěnu a táhněte'}
           </div>
         )}
       </div>

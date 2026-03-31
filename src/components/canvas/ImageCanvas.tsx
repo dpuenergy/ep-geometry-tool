@@ -187,6 +187,19 @@ export default function ImageCanvas() {
   const [vertexSnap, setVertexSnap] = useState<Point | null>(null)
   const [cornersLoading, setCornersLoading]   = useState(false)
 
+  // ── Orthogonal snap (Shift key) ──
+  const shiftRef  = useRef(false)
+  const [orthoSnap, setOrthoSnap] = useState<Point | null>(null)
+  const [orthoAxis, setOrthoAxis] = useState<'h' | 'v' | null>(null)
+
+  // ── Vertex drag (idle mode) ──
+  const [hoveredVertex, setHoveredVertex]       = useState<Point | null>(null)
+  const [isVertexDragging, setIsVertexDragging] = useState(false)
+  const [vertexDragPreview, setVertexDragPreview] = useState<Point | null>(null)
+  const vertexDragOrig    = useRef<Point | null>(null)
+  const vertexDragCurrentRef = useRef<Point | null>(null)
+  const isVertexDraggingRef = useRef(false)
+
   // ── PDF ──
   const [pdfLoading, setPdfLoading]     = useState(false)
   const [pdfError, setPdfError]         = useState<string | null>(null)
@@ -207,6 +220,21 @@ export default function ImageCanvas() {
 
   // ── Double-click guard ──
   const lastClickTs = useRef(0)
+
+  // ── Shift key tracker for orthogonal snap ──
+  useEffect(() => {
+    const down = (e: KeyboardEvent) => { if (e.key === 'Shift') shiftRef.current = true }
+    const up   = (e: KeyboardEvent) => {
+      if (e.key === 'Shift') {
+        shiftRef.current = false
+        setOrthoSnap(null)
+        setOrthoAxis(null)
+      }
+    }
+    window.addEventListener('keydown', down)
+    window.addEventListener('keyup', up)
+    return () => { window.removeEventListener('keydown', down); window.removeEventListener('keyup', up) }
+  }, [])
 
   // ── Container width ──
   const containerRef = useRef<HTMLDivElement>(null)
@@ -259,6 +287,20 @@ export default function ImageCanvas() {
     const pts = drawPointsRef.current
     if (!pts.length) return Infinity
     return Math.sqrt((pos.x - pts[0].x) ** 2 + (pos.y - pts[0].y) ** 2)
+  }
+
+  /** If Shift is held and ≥1 point drawn, project pos onto nearest orthogonal axis from last point. */
+  function applyOrtho(pos: Point): { point: Point; axis: 'h' | 'v' } | null {
+    const pts = drawPointsRef.current
+    if (!shiftRef.current || pts.length === 0) return null
+    const last = pts[pts.length - 1]
+    const dx = Math.abs(pos.x - last.x)
+    const dy = Math.abs(pos.y - last.y)
+    if (dx >= dy) {
+      return { point: { x: pos.x, y: last.y }, axis: 'h' }
+    } else {
+      return { point: { x: last.x, y: pos.y }, axis: 'v' }
+    }
   }
 
   function closePolygon() {
@@ -407,14 +449,45 @@ export default function ImageCanvas() {
     return best
   }
 
+  /** Find closest polygon vertex on active drawing for idle-mode vertex drag. */
+  function findDraggableVertex(pos: Point): Point | null {
+    const r = snapR()
+    let best: Point | null = null
+    let bestDist = r
+    const drawingId = project.activeDrawingId
+    const candidates: Point[] = [
+      ...project.zones.filter(z => z.drawingId === drawingId).flatMap(z => z.points),
+      ...project.surfaces.filter(s => s.drawingId === drawingId).flatMap(s => s.points),
+    ]
+    for (const v of candidates) {
+      const d = Math.hypot(pos.x - v.x, pos.y - v.y)
+      if (d < bestDist) { bestDist = d; best = v }
+    }
+    return best
+  }
+
   const handleMouseMove = useCallback((e: KonvaEventObject<MouseEvent>) => {
     const sp = e.target.getStage()?.getPointerPosition()
     if (!sp) return
     const pos = screenToWorld(sp)
     setCursorPos(pos)
+
+    // If vertex drag is active, update preview position
+    if (isVertexDraggingRef.current) {
+      vertexDragCurrentRef.current = pos
+      setVertexDragPreview(pos)
+      return
+    }
+
     if (mode === 'drawing') {
-      setVertexSnap(findVertexSnap(pos))
-      setCornerSnap(findCornerSnap(pos))
+      // Apply orthogonal constraint first, then snap vertex/corner on constrained pos
+      const ortho = applyOrtho(pos)
+      setOrthoSnap(ortho?.point ?? null)
+      setOrthoAxis(ortho?.axis ?? null)
+      const base = ortho?.point ?? pos
+      setVertexSnap(findVertexSnap(base))
+      setCornerSnap(findCornerSnap(base))
+      // Close-polygon indicator always uses raw cursor pos, not ortho-constrained point
       if (drawPointsRef.current.length >= 3) {
         setSnapActive(distToFirst(pos) <= snapR())
       } else {
@@ -423,7 +496,13 @@ export default function ImageCanvas() {
     } else {
       setVertexSnap(null)
       setCornerSnap(null)
+      setOrthoSnap(null)
+      setOrthoAxis(null)
       setSnapActive(false)
+      // In idle mode: detect vertex hover for drag handle highlight
+      if (mode === 'idle') {
+        setHoveredVertex(findDraggableVertex(pos))
+      }
     }
   }, [mode, detectedCorners, project.zones, project.surfaces, project.activeDrawingId]) // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -432,6 +511,9 @@ export default function ImageCanvas() {
     setSnapActive(false)
     setVertexSnap(null)
     setCornerSnap(null)
+    setOrthoSnap(null)
+    setOrthoAxis(null)
+    setHoveredVertex(null)
   }, [])
 
   // ── Click ──────────────────────────────────────────────────────────────────
@@ -463,12 +545,16 @@ export default function ImageCanvas() {
       return
     }
     if (mode === 'drawing') {
+      // Priority: ortho constraint → then vertex/corner snap on constrained point
+      const ortho = applyOrtho(pos)
+      const base  = ortho?.point ?? pos
+      // Close check always uses raw cursor proximity – ortho shouldn't block closing
       if (drawPointsRef.current.length >= 3 && distToFirst(pos) <= snapR()) {
         closePolygon(); return
       }
-      // Priority: vertex snap (exact match with existing polygon) > corner snap > raw pos
-      const snapped = findVertexSnap(pos) ?? findCornerSnap(pos)
-      setDrawPoints(pts => [...pts, snapped ?? pos])
+      // Vertex snap > corner snap > ortho-constrained pos > raw pos
+      const snapped = findVertexSnap(base) ?? findCornerSnap(base)
+      setDrawPoints(pts => [...pts, snapped ?? base])
       return
     }
     if (mode === 'idle') {
@@ -477,6 +563,123 @@ export default function ImageCanvas() {
       selectSurface(null)
     }
   }, [mode, scalePointA, scaleDistInput, setScale, selectEdge, selectZone, selectSurface]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  /** Convert native client coords → world coords (bypasses Konva event system). */
+  function clientToWorld(clientX: number, clientY: number): Point | null {
+    const stage = stageRef.current
+    if (!stage) return null
+    const rect = stage.container().getBoundingClientRect()
+    return screenToWorld({ x: clientX - rect.left, y: clientY - rect.top })
+  }
+
+  /** Set cursor on the Konva canvas element directly (overrides Konva's own cursor). */
+  function setCanvasCursor(cursor: string) {
+    const container = stageRef.current?.container()
+    if (!container) return
+    container.style.cursor = cursor
+    const canvas = container.querySelector('canvas') as HTMLCanvasElement | null
+    if (canvas) canvas.style.cursor = cursor
+  }
+
+  // ── Vertex drag + hover via window-level events ────────────────────────────
+  useEffect(() => {
+    if (mode !== 'idle') {
+      setCanvasCursor('crosshair')
+      return
+    }
+
+    /** Nearest vertex within snap radius, using live store data. */
+    function nearestVertex(pos: Point): Point | null {
+      const { project: proj } = useProjectStore.getState()
+      const r = SNAP_PX / scaleRef.current
+      let best: Point | null = null
+      let bestDist = r
+      const drawingId = proj.activeDrawingId
+      const cands: Point[] = [
+        ...proj.zones.filter(z => z.drawingId === drawingId).flatMap(z => z.points),
+        ...proj.surfaces.filter(s => s.drawingId === drawingId).flatMap(s => s.points),
+      ]
+      for (const v of cands) {
+        const d = Math.hypot(pos.x - v.x, pos.y - v.y)
+        if (d < bestDist) { bestDist = d; best = v }
+      }
+      return best
+    }
+
+    /** Is the native mouse position inside the canvas element? */
+    function isOverCanvas(clientX: number, clientY: number): boolean {
+      const rect = stageRef.current?.container().getBoundingClientRect()
+      if (!rect) return false
+      return clientX >= rect.left && clientX <= rect.right && clientY >= rect.top && clientY <= rect.bottom
+    }
+
+    const onMouseMove = (e: MouseEvent) => {
+      if (isVertexDraggingRef.current) {
+        // Update drag preview
+        const pos = clientToWorld(e.clientX, e.clientY)
+        if (!pos) return
+        vertexDragCurrentRef.current = pos
+        setVertexDragPreview(pos)
+        setCanvasCursor('grabbing')
+        return
+      }
+      // Hover detection: only when cursor is over the canvas
+      if (!isOverCanvas(e.clientX, e.clientY)) {
+        setHoveredVertex(null)
+        setCanvasCursor('grab')
+        return
+      }
+      const pos = clientToWorld(e.clientX, e.clientY)
+      if (!pos) return
+      const v = nearestVertex(pos)
+      setHoveredVertex(v)
+      setCanvasCursor(v ? 'crosshair' : 'grab')
+    }
+
+    const onMouseDown = (e: MouseEvent) => {
+      if (e.button !== 0) return
+      if (!isOverCanvas(e.clientX, e.clientY)) return
+      const pos = clientToWorld(e.clientX, e.clientY)
+      if (!pos) return
+      const v = nearestVertex(pos)
+      if (!v) return
+      vertexDragOrig.current = v
+      vertexDragCurrentRef.current = v
+      isVertexDraggingRef.current = true
+      setIsVertexDragging(true)
+      setVertexDragPreview(v)
+      setCanvasCursor('grabbing')
+      e.stopPropagation()  // prevent Konva stage from starting pan
+    }
+
+    const onMouseUp = (_e: MouseEvent) => {
+      if (!isVertexDraggingRef.current) return
+      const orig = vertexDragOrig.current
+      const newPt = vertexDragCurrentRef.current
+      if (orig && newPt && Math.hypot(newPt.x - orig.x, newPt.y - orig.y) > 1) {
+        const { moveVertex: mv, project: proj } = useProjectStore.getState()
+        mv(proj.activeDrawingId, orig, newPt)
+      }
+      vertexDragOrig.current = null
+      vertexDragCurrentRef.current = null
+      isVertexDraggingRef.current = false
+      setIsVertexDragging(false)
+      setVertexDragPreview(null)
+      setHoveredVertex(null)
+      setCanvasCursor('grab')
+    }
+
+    setCanvasCursor('grab')
+    window.addEventListener('mousemove', onMouseMove)
+    window.addEventListener('mousedown', onMouseDown, true)
+    window.addEventListener('mouseup', onMouseUp)
+    return () => {
+      window.removeEventListener('mousemove', onMouseMove)
+      window.removeEventListener('mousedown', onMouseDown, true)
+      window.removeEventListener('mouseup', onMouseUp)
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode])
 
   const handleDblClick = useCallback((_e: KonvaEventObject<MouseEvent>) => {
     if (mode === 'drawing') closePolygon()
@@ -500,19 +703,21 @@ export default function ImageCanvas() {
   const scaleSet       = !!activeDrawing?.scale
   const scaleDistValid = scaleDistInput !== '' && parseFloat(scaleDistInput) > 0
 
-  // Priority: snap-to-first > vertex snap > corner snap > raw cursor
+  // Priority: snap-to-first > vertex snap > corner snap > ortho > raw cursor
   const activeSnapPoint: Point | null =
     (snapActive && drawPoints.length >= 3) ? drawPoints[0]
-    : vertexSnap ?? cornerSnap ?? null
+    : vertexSnap ?? cornerSnap ?? orthoSnap ?? null
 
   const previewTarget: Point | null = activeSnapPoint ?? cursorPos
 
-  // Rubber-band colour: green = vertex/first snap, amber = image corner snap, blue = free
+  // Rubber-band colour: green = vertex/first snap, amber = corner snap, violet = ortho, blue = free
   const rubberBandColor =
-    snapActive || vertexSnap ? '#22c55e' : cornerSnap ? '#f59e0b' : '#3b82f6'
+    snapActive || vertexSnap ? '#22c55e'
+    : cornerSnap ? '#f59e0b'
+    : orthoSnap  ? '#a855f7'
+    : '#3b82f6'
 
-  // Cursor: hand when idle (pan available), crosshair when drawing/calibrating
-  const cursorClass = mode === 'idle' ? 'cursor-grab active:cursor-grabbing' : 'cursor-crosshair'
+  const cursorClass = ''  // cursor managed imperatively in vertex drag useEffect
 
   // Overlay element sizes scale inversely so they stay constant on screen
   const inv = 1 / renderScale
@@ -694,7 +899,12 @@ export default function ImageCanvas() {
               Klikněte na <strong>druhý bod</strong> — vzdálenost: {scaleDistInput} m
             </p>
           )}
-          {mode === 'drawing' && (
+          {mode === 'drawing' && orthoSnap && (
+            <p className="text-sm bg-purple-50 rounded px-2 py-0.5" style={{ color: '#7e22ce' }}>
+              {orthoAxis === 'h' ? '↔ Vodorovně' : '↕ Svisle'} — Shift pro kolmý úhel
+            </p>
+          )}
+          {mode === 'drawing' && !orthoSnap && (
             <p className="text-sm text-blue-700 bg-blue-50 rounded px-2 py-0.5">
               {drawPoints.length === 0
                 ? `Klikněte na první bod ${isElevOrSection ? 'plochy' : 'zóny'}`
@@ -703,12 +913,22 @@ export default function ImageCanvas() {
                 : snapActive
                 ? '🟢 Klikněte pro zavření polygonu'
                 : `${drawPoints.length} bodů – dvojklik nebo klik na ● pro zavření`}
-              <span className="text-blue-500 ml-2 text-xs">· tažení = posun · kolečko = zoom</span>
+              <span className="text-blue-500 ml-2 text-xs">· tažení = posun · kolečko = zoom · Shift = kolmý úhel</span>
             </p>
           )}
-          {mode === 'idle' && (
+          {mode === 'idle' && isVertexDragging && (
+            <p className="text-xs text-orange-600 bg-orange-50 rounded px-2 py-0.5">
+              Přesunujte roh — uvolněte myš pro potvrzení
+            </p>
+          )}
+          {mode === 'idle' && !isVertexDragging && hoveredVertex && (
+            <p className="text-xs text-orange-600 bg-orange-50 rounded px-2 py-0.5">
+              Uchopte a táhněte pro přesun rohu
+            </p>
+          )}
+          {mode === 'idle' && !isVertexDragging && !hoveredVertex && (
             <p className="text-xs text-gray-400">
-              Tažení = posun &nbsp;·&nbsp; kolečko = zoom
+              Tažení = posun &nbsp;·&nbsp; kolečko = zoom &nbsp;·&nbsp; rohové body = přetažením upravit
             </p>
           )}
         </div>
@@ -719,8 +939,11 @@ export default function ImageCanvas() {
             ref={stageRef}
             width={canvasW}
             height={CANVAS_H}
-            draggable
-            onDragStart={() => { stageDragged.current = false }}
+            draggable={mode === 'idle' && !isVertexDragging}
+            onDragStart={(e) => {
+              if (isVertexDraggingRef.current) { e.target.stopDrag(); return }
+              stageDragged.current = false
+            }}
             onDragMove={() => { stageDragged.current = true }}
             onWheel={handleWheel}
             onClick={handleClick}
@@ -816,6 +1039,51 @@ export default function ImageCanvas() {
               </Layer>
             )}
 
+            {/* Vertex drag handles – visible in idle mode */}
+            {mode === 'idle' && (
+              <Layer listening={false}>
+                {[
+                  ...project.zones.filter(z => z.drawingId === project.activeDrawingId).flatMap(z => z.points),
+                  ...project.surfaces.filter(s => s.drawingId === project.activeDrawingId).flatMap(s => s.points),
+                ].map((v, i) => {
+                  const isHovered = hoveredVertex && Math.hypot(v.x - hoveredVertex.x, v.y - hoveredVertex.y) < 1
+                  const isDragging = isVertexDragging && vertexDragOrig.current &&
+                    Math.hypot(v.x - vertexDragOrig.current.x, v.y - vertexDragOrig.current.y) < 1
+                  return (
+                    <Circle
+                      key={i}
+                      x={v.x} y={v.y}
+                      radius={(isHovered || isDragging ? 6 : 4) * inv}
+                      fill={isHovered || isDragging ? '#f97316' : 'rgba(249,115,22,0.35)'}
+                      stroke={isHovered || isDragging ? '#ea580c' : 'transparent'}
+                      strokeWidth={1.5 * inv}
+                    />
+                  )
+                })}
+                {/* Ghost of dragged vertex at original position */}
+                {isVertexDragging && vertexDragOrig.current && (
+                  <Circle
+                    x={vertexDragOrig.current.x} y={vertexDragOrig.current.y}
+                    radius={4 * inv}
+                    fill="transparent"
+                    stroke="#f97316"
+                    strokeWidth={1.5 * inv}
+                    dash={[3 * inv, 3 * inv]}
+                  />
+                )}
+                {/* Preview position while dragging */}
+                {isVertexDragging && vertexDragPreview && (
+                  <Circle
+                    x={vertexDragPreview.x} y={vertexDragPreview.y}
+                    radius={6 * inv}
+                    fill="#f97316"
+                    stroke="#ea580c"
+                    strokeWidth={2 * inv}
+                  />
+                )}
+              </Layer>
+            )}
+
             {/* Drawing overlay (non-interactive) */}
             <Layer listening={false}>
 
@@ -828,6 +1096,24 @@ export default function ImageCanvas() {
               {drawPoints.length >= 2 && (
                 <Line points={drawPoints.flatMap(p => [p.x, p.y])} stroke="#3b82f6" strokeWidth={2 * inv} />
               )}
+
+              {/* Orthogonal axis guide – extends past cursor along locked axis */}
+              {orthoSnap && drawPoints.length >= 1 && cursorPos && (() => {
+                const last = drawPoints[drawPoints.length - 1]
+                const ext  = 4000  // extend far in both directions
+                const x1 = orthoAxis === 'h' ? last.x - ext : last.x
+                const y1 = orthoAxis === 'h' ? last.y       : last.y - ext
+                const x2 = orthoAxis === 'h' ? last.x + ext : last.x
+                const y2 = orthoAxis === 'h' ? last.y       : last.y + ext
+                return (
+                  <Line
+                    points={[x1, y1, x2, y2]}
+                    stroke="rgba(168,85,247,0.35)"
+                    strokeWidth={1 * inv}
+                    dash={[6 * inv, 4 * inv]}
+                  />
+                )
+              })()}
 
               {/* Rubber-band */}
               {drawPoints.length >= 1 && previewTarget && (

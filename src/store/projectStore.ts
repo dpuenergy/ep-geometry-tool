@@ -149,6 +149,9 @@ interface ProjectState {
   addOpening: (edgeId: string, opening: Omit<Opening, 'id'>) => void
   removeOpening: (edgeId: string, openingId: string) => void
   confirmNoOpenings: (edgeId: string) => void
+  moveWallEdge: (edgeId: string, offsetMeters: number) => void
+  resizeEdge: (edgeId: string, newLengthMeters: number) => void
+  moveVertex: (drawingId: string, oldPoint: Point, newPoint: Point) => void
   linkEdges: (edgeId: string, linkedEdgeId: string | null) => void
   selectEdge: (edgeId: string | null) => void
   selectedEdgeId: string | null
@@ -731,6 +734,135 @@ export const useProjectStore = create<ProjectState>()(
           const edges = { ...s.project.edges, [edgeId]: updated }
           const project = { ...s.project, edges }
           return { project, metrics: computeMetrics(project) }
+        }),
+
+      moveWallEdge: (edgeId, offsetMeters) =>
+        set(st => {
+          const { project } = st
+          const edge = project.edges[edgeId]
+          if (!edge || Math.abs(offsetMeters) < 0.001) return st
+          const zone = project.zones.find(z => z.edgeIds.includes(edgeId))
+          if (!zone) return st
+          const drawing = project.drawings.find(d => d.id === zone.drawingId)
+          if (!drawing?.scale) return st
+          const ppm = drawing.scale.pixelsPerMeter
+          const [p1, p2] = edge.points
+          const edx = p2.x - p1.x, edy = p2.y - p1.y
+          const len = Math.hypot(edx, edy)
+          if (len < 1e-6) return st
+          // Wall normal in pixel space (perpendicular to edge direction)
+          const nx = -edy / len, ny = edx / len
+          const dpx = nx * offsetMeters * ppm
+          const dpy = ny * offsetMeters * ppm
+          const EPS = 3
+          const newEdgesRecord = { ...project.edges }
+          const newZones = project.zones.map(z => {
+            if (z.drawingId !== zone.drawingId) return z
+            let changed = false
+            const newPoints = z.points.map(p => {
+              const m1 = Math.hypot(p.x - p1.x, p.y - p1.y) < EPS
+              const m2 = Math.hypot(p.x - p2.x, p.y - p2.y) < EPS
+              if (m1 || m2) { changed = true; return { x: p.x + dpx, y: p.y + dpy } }
+              return p
+            })
+            if (!changed) return z
+            // Update edges belonging to this zone
+            for (const eid of z.edgeIds) {
+              const e = newEdgesRecord[eid]; if (!e) continue
+              const [eq1, eq2] = e.points
+              const u1 = Math.hypot(eq1.x-p1.x, eq1.y-p1.y)<EPS || Math.hypot(eq1.x-p2.x, eq1.y-p2.y)<EPS
+              const u2 = Math.hypot(eq2.x-p1.x, eq2.y-p1.y)<EPS || Math.hypot(eq2.x-p2.x, eq2.y-p2.y)<EPS
+              const neq1: Point = u1 ? { x: eq1.x + dpx, y: eq1.y + dpy } : eq1
+              const neq2: Point = u2 ? { x: eq2.x + dpx, y: eq2.y + dpy } : eq2
+              const newLen = round2(pxToMeters(distancePx(neq1, neq2), drawing.scale!))
+              const newE: Edge = { ...e, points: [neq1, neq2], lengthMeters: newLen }
+              newEdgesRecord[eid] = { ...newE, status: deriveEdgeStatus(newE) }
+            }
+            const areaM2 = round2(pxAreaToM2(polygonAreaPx(newPoints), drawing.scale!))
+            return { ...z, points: newPoints, areaM2 }
+          })
+          const updated = { ...project, zones: newZones, edges: newEdgesRecord }
+          return { project: updated, metrics: computeMetrics(updated) }
+        }),
+
+      resizeEdge: (edgeId, newLengthMeters) =>
+        set(st => {
+          const { project } = st
+          const edge = project.edges[edgeId]
+          if (!edge || newLengthMeters <= 0) return st
+          const zone = project.zones.find(z => z.edgeIds.includes(edgeId))
+          if (!zone) return st
+          const drawing = project.drawings.find(d => d.id === zone.drawingId)
+          if (!drawing?.scale) return st
+          const ppm = drawing.scale.pixelsPerMeter
+          const [p1, p2] = edge.points
+          const dx = p2.x - p1.x, dy = p2.y - p1.y
+          const len = Math.hypot(dx, dy)
+          if (len < 1e-6) return st
+          // Keep p1 fixed, move p2 along edge direction to achieve new length
+          const newP2: Point = {
+            x: p1.x + (dx / len) * newLengthMeters * ppm,
+            y: p1.y + (dy / len) * newLengthMeters * ppm,
+          }
+          const EPS = 3
+          const newEdgesRecord = { ...project.edges }
+          const newZones = project.zones.map(z => {
+            if (z.drawingId !== zone.drawingId) return z
+            let changed = false
+            const newPoints = z.points.map(p => {
+              if (Math.hypot(p.x - p2.x, p.y - p2.y) < EPS) { changed = true; return newP2 }
+              return p
+            })
+            if (!changed) return z
+            for (const eid of z.edgeIds) {
+              const e = newEdgesRecord[eid]; if (!e) continue
+              const [eq1, eq2] = e.points
+              const u1 = Math.hypot(eq1.x - p2.x, eq1.y - p2.y) < EPS
+              const u2 = Math.hypot(eq2.x - p2.x, eq2.y - p2.y) < EPS
+              const neq1: Point = u1 ? newP2 : eq1
+              const neq2: Point = u2 ? newP2 : eq2
+              const newLen = round2(pxToMeters(distancePx(neq1, neq2), drawing.scale!))
+              const newE: Edge = { ...e, points: [neq1, neq2], lengthMeters: newLen }
+              newEdgesRecord[eid] = { ...newE, status: deriveEdgeStatus(newE) }
+            }
+            const areaM2 = round2(pxAreaToM2(polygonAreaPx(newPoints), drawing.scale!))
+            return { ...z, points: newPoints, areaM2 }
+          })
+          const updated = { ...project, zones: newZones, edges: newEdgesRecord }
+          return { project: updated, metrics: computeMetrics(updated) }
+        }),
+
+      moveVertex: (drawingId, oldPoint, newPoint) =>
+        set(st => {
+          const { project } = st
+          const drawing = project.drawings.find(d => d.id === drawingId)
+          if (!drawing?.scale) return st
+          const EPS = 3
+          const newEdgesRecord = { ...project.edges }
+          const newZones = project.zones.map(z => {
+            if (z.drawingId !== drawingId) return z
+            let changed = false
+            const newPoints = z.points.map(p => {
+              if (Math.hypot(p.x - oldPoint.x, p.y - oldPoint.y) < EPS) { changed = true; return newPoint }
+              return p
+            })
+            if (!changed) return z
+            for (const eid of z.edgeIds) {
+              const e = newEdgesRecord[eid]; if (!e) continue
+              const [eq1, eq2] = e.points
+              const u1 = Math.hypot(eq1.x - oldPoint.x, eq1.y - oldPoint.y) < EPS
+              const u2 = Math.hypot(eq2.x - oldPoint.x, eq2.y - oldPoint.y) < EPS
+              const neq1: Point = u1 ? newPoint : eq1
+              const neq2: Point = u2 ? newPoint : eq2
+              const newLen = round2(pxToMeters(distancePx(neq1, neq2), drawing.scale!))
+              const newE: Edge = { ...e, points: [neq1, neq2], lengthMeters: newLen }
+              newEdgesRecord[eid] = { ...newE, status: deriveEdgeStatus(newE) }
+            }
+            const areaM2 = round2(pxAreaToM2(polygonAreaPx(newPoints), drawing.scale!))
+            return { ...z, points: newPoints, areaM2 }
+          })
+          const updated = { ...project, zones: newZones, edges: newEdgesRecord }
+          return { project: updated, metrics: computeMetrics(updated) }
         }),
 
       linkEdges: (edgeId, linkedEdgeId) =>

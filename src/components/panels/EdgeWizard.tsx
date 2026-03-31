@@ -2,14 +2,45 @@
 // Plan edges:             step 1 only (construction type) → auto-complete
 // Elevation/section edges: step 1 + step 2 (openings from elevation view)
 
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useProjectStore } from '../../store/projectStore'
 import { useLibraryStore } from '../../store/libraryStore'
 import {
   Construction, ConstructionType, Opening,
   DrawingViewType, DRAWING_VIEW_LABELS, VIEW_CONSTRUCTION_PRIORITY,
+  Edge, Project,
 } from '../../types'
 import { round2, netWallArea } from '../../utils/geometry'
+
+/** Suggest a construction type for an edge based on its geometry and context. */
+function suggestConstructionType(
+  edge: Edge,
+  project: Project,
+  drawingId: string | null,
+  _viewType: DrawingViewType,
+  isPlanEdge: boolean,
+): ConstructionType {
+  if (isPlanEdge && drawingId) {
+    const [p1, p2] = edge.points
+    const EPS = 3
+    const allEdges = project.zones
+      .filter(z => z.drawingId === drawingId)
+      .flatMap(z => z.edgeIds.map(id => project.edges[id]).filter(Boolean))
+    for (const e of allEdges) {
+      if (e.id === edge.id) continue
+      const [q1, q2] = e.points
+      const fwd = Math.hypot(p1.x-q1.x, p1.y-q1.y) < EPS && Math.hypot(p2.x-q2.x, p2.y-q2.y) < EPS
+      const rev = Math.hypot(p1.x-q2.x, p1.y-q2.y) < EPS && Math.hypot(p2.x-q1.x, p2.y-q1.y) < EPS
+      if (fwd || rev) return 'interior_wall'
+    }
+    return 'exterior_wall'
+  }
+  // Elevation / section: suggest by edge angle
+  const [p1, p2] = edge.points
+  const angle = Math.atan2(Math.abs(p2.y - p1.y), Math.abs(p2.x - p1.x)) * 180 / Math.PI
+  if (angle < 25) return 'roof_flat'   // mostly horizontal → roof
+  return 'exterior_wall'               // mostly vertical → wall
+}
 
 const STEP_LABELS = ['1. Konstrukce', '2. Výplně']
 
@@ -50,7 +81,7 @@ export default function EdgeWizard() {
   const {
     project, selectedEdgeId,
     setEdgeConstruction, addOpening, removeOpening, confirmNoOpenings,
-    linkEdges, selectEdge,
+    resizeEdge, linkEdges, selectEdge,
   } = useProjectStore()
   const { constructions } = useLibraryStore()
 
@@ -59,10 +90,33 @@ export default function EdgeWizard() {
   const [customThickness, setCustomThickness] = useState<string>('')
   const [openingForm, setOpeningForm]   = useState<OpeningFormState>(emptyOpeningForm())
   const [showOpeningForm, setShowOpeningForm] = useState(false)
+  const [autoSuggested, setAutoSuggested] = useState(false)
+  const [lengthInput, setLengthInput] = useState('')
+  const [lengthError, setLengthError] = useState(false)
 
   const edgeId = selectedEdgeId
   const edge   = edgeId ? project.edges[edgeId] : null
-  const { height: drawingHeight, viewType, isPlanEdge } = useEdgeContext(edgeId)
+  const { height: drawingHeight, viewType, drawingId, isPlanEdge } = useEdgeContext(edgeId)
+
+  // Auto-suggest construction type when a new edge is selected
+  useEffect(() => {
+    if (!edge) return
+    if (edge.construction) {
+      setSelectedType(edge.construction.type)
+      setAutoSuggested(false)
+      setStep(edge.openingsConfirmed || isPlanEdge ? 1 : 2)
+    } else {
+      const suggested = suggestConstructionType(edge, project, drawingId, viewType, isPlanEdge)
+      setSelectedType(suggested)
+      setAutoSuggested(true)
+      setStep(1)
+    }
+    setCustomThickness('')
+    setOpeningForm(emptyOpeningForm())
+    setShowOpeningForm(false)
+    setLengthInput(String(edge.lengthMeters))
+    setLengthError(false)
+  }, [edgeId]) // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!edge) {
     return (
@@ -91,6 +145,7 @@ export default function EdgeWizard() {
 
   function handleTypeSelect(type: ConstructionType) {
     setSelectedType(type)
+    setAutoSuggested(false)
     setCustomThickness('') // reset override when type changes
   }
 
@@ -143,6 +198,13 @@ export default function EdgeWizard() {
     setCustomThickness('')
   }
 
+  function handleResizeEdge() {
+    const val = parseFloat(lengthInput.replace(',', '.'))
+    if (isNaN(val) || val <= 0) { setLengthError(true); return }
+    setLengthError(false)
+    resizeEdge(safeEdge.id, val)
+  }
+
   // ── Render ─────────────────────────────────────────────────────────────────
 
   return (
@@ -167,8 +229,29 @@ export default function EdgeWizard() {
       </div>
 
       {/* Edge info */}
-      <div className="text-xs text-gray-500 space-y-0.5">
-        <div>Délka: <strong>{edge.lengthMeters} m</strong></div>
+      <div className="text-xs text-gray-500 space-y-1">
+        <div className="flex items-center gap-1.5">
+          <span>Délka:</span>
+          <input
+            type="number"
+            min="0.01"
+            step="0.01"
+            className={`input w-20 text-xs py-0.5 ${lengthError ? 'border-red-400 ring-1 ring-red-300' : ''}`}
+            value={lengthInput}
+            onChange={e => { setLengthInput(e.target.value); setLengthError(false) }}
+            onKeyDown={e => { if (e.key === 'Enter') handleResizeEdge() }}
+          />
+          <span className="text-gray-400">m</span>
+          {parseFloat(lengthInput.replace(',', '.')) !== edge.lengthMeters && (
+            <button
+              className="btn-primary text-xs py-0.5 px-2"
+              onClick={handleResizeEdge}
+            >
+              ✓
+            </button>
+          )}
+          {lengthError && <span className="text-red-500">!</span>}
+        </div>
         {edge.construction && (
           <div>
             Konstrukce: <strong>{edge.construction.name}</strong>
@@ -218,7 +301,13 @@ export default function EdgeWizard() {
       {/* ── STEP 1 ── */}
       {(step === 1 || isPlanEdge) && (
         <div className="flex flex-col gap-2">
-          <p className="text-xs text-gray-600">Vyberte typ konstrukce:</p>
+          {autoSuggested && selectedType ? (
+            <p className="text-xs text-amber-700 bg-amber-50 rounded px-2 py-1">
+              💡 Navrhujeme na základě polohy hrany — potvrďte nebo vyberte jiný typ:
+            </p>
+          ) : (
+            <p className="text-xs text-gray-600">Vyberte typ konstrukce:</p>
+          )}
           <div className="flex flex-col gap-1 max-h-48 overflow-y-auto">
             {sortedConstructions.map((c) => (
               <button
